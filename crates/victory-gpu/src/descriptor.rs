@@ -218,7 +218,7 @@ pub(crate) fn make_read(slots: &[u32]) {
             .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
             .filter(|heap| heap.desc.kind == VIEWS_KIND)
             .filter_map(|heap| heap.host.get()?.as_ref().map(|host| (heap, host)))
-            .flat_map(|(heap, host)| slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| host.unmade_placed(i)))
+            .flat_map(|(heap, host)| slots.iter().filter(|&&s| host.title_of(s).is_some_and(|i| i < heap.desc.count)).filter_map(|&s| host.unmade_placed(s)))
             .collect()
     };
     #[cfg(test)]
@@ -238,9 +238,14 @@ pub(crate) fn make_read(slots: &[u32]) {
         if heap.desc.kind != VIEWS_KIND {
             continue;
         }
-        for &i in slots.iter().filter(|&&i| i < heap.desc.count) {
+        // Shaders mark reads by host slot; the title's record is at its own
+        // slot, which differs where the host holds the title's by blocks.
+        for &slot in slots {
+            let Some(i) = host.title_of(slot).filter(|&i| i < heap.desc.count) else {
+                continue;
+            };
             host.mirror(i, start + u64::from(i) * u64::from(step), true);
-            host.stamp_read(i);
+            host.stamp_read(slot);
         }
     }
 }

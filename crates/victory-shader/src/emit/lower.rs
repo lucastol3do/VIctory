@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
-use super::shader::{Shader, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
+use super::shader::{Shader, VIEW_BLOCK_SHIFT, VIEW_BLOCKS, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, flags};
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Elsewhere, Export, Input, Interp, Io, Target};
@@ -5549,7 +5549,7 @@ impl<'a> Lower<'a> {
             return index;
         }
         let c = self.cur;
-        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let last = self.s.m.i32(super::heap_views() - 1);
         let over = self.s.m.cmp(c, pred::IUGT, index, last);
         let index = self.s.m.select(c, over, last, index);
         let four = self.s.m.i32(4);
@@ -5562,9 +5562,38 @@ impl<'a> Lower<'a> {
         let zero = self.s.m.i32(0);
         let none = self.s.m.cmp(c, pred::EQ, stride, zero);
         // The null unordered access view sits just below the null SRV.
-        let null = super::NULL_BUFFER_VIEW - u32::from(props.0 & 0x1000 != 0);
+        let null = super::null_buffer_view() - u32::from(props.0 & 0x1000 != 0);
         let null = self.s.m.i32(null);
         self.s.m.select(c, none, null, index)
+    }
+
+    /// The host's heap index for the view heap index `index` that a load
+    /// of a descriptor from a root parameter of type `root` gives, computed
+    /// in the current block. The same index, except for a descriptor from
+    /// the resource heap itself on a host whose view heaps hold the title's
+    /// slots by blocks (module notes, "Heap indices"): there the index is
+    /// the title's, and the host's is the view-block table's entry for its
+    /// block (root SRV [`VIEW_BLOCKS`]) plus the index within the block. A
+    /// table's slots are the host's already: the host passes where the
+    /// table lies.
+    fn host_index(&mut self, root: Option<RootType>, index: V, sampler: bool) -> V {
+        if sampler || root != Some(RootType::ResourceHeap) || !super::view_blocks() {
+            return index;
+        }
+        let c = self.cur;
+        // The table has an entry for each block below `HEAP_VIEWS`.
+        let last = self.s.m.i32(super::HEAP_VIEWS - 1);
+        let over = self.s.m.cmp(c, pred::IUGT, index, last);
+        let index = self.s.m.select(c, over, last, index);
+        let shift = self.s.m.i32(VIEW_BLOCK_SHIFT);
+        let block = self.s.m.bin(c, Bin::LShr, index, shift);
+        let two = self.s.m.i32(2);
+        let at = self.s.m.bin(c, Bin::Shl, block, two);
+        let table = self.s.root_srv_handle(VIEW_BLOCKS);
+        let first = self.raw_dword(table, at);
+        let within = self.s.m.i32((1 << VIEW_BLOCK_SHIFT) - 1);
+        let within = self.s.m.bin(c, Bin::And, index, within);
+        self.s.m.bin(c, Bin::Add, first, within)
     }
 
     /// Whether a descriptor comes from the resource heap itself (root type
@@ -5712,7 +5741,8 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
+        let root = self.x.native.layout.get(a.param).map(|p| p.root);
+        match root {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
         }
@@ -5742,7 +5772,8 @@ impl<'a> Lower<'a> {
             .i32((offset as i32 as u32).wrapping_add(4 * u32::from(first)));
         at = self.s.m.bin(c, Bin::Add, at, k);
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, at, shift))
+        let index = self.s.m.bin(c, Bin::LShr, at, shift);
+        Ok(self.host_index(root, index, sampler))
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -5752,7 +5783,8 @@ impl<'a> Lower<'a> {
             .scalar
             .get(&load)
             .ok_or("an untracked descriptor load")?;
-        match self.x.native.layout.get(a.param).map(|p| p.root) {
+        let root = self.x.native.layout.get(a.param).map(|p| p.root);
+        match root {
             Some(RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap) => {}
             _ => return Err("a descriptor outside the heaps"),
         }
@@ -5782,7 +5814,8 @@ impl<'a> Lower<'a> {
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         let shift = self.s.m.i32(if sampler { 4 } else { 5 });
-        Ok(self.s.m.bin(c, Bin::LShr, addr, shift))
+        let index = self.s.m.bin(c, Bin::LShr, addr, shift);
+        Ok(self.host_index(root, index, sampler))
     }
 
     fn valu(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
