@@ -1008,10 +1008,15 @@ impl HostHeap {
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             (first..last)
                 .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match made.get(i as usize) {
-                    Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
-                    Some(&m) => m != 0,
-                    None => true,
+                // `made` is indexed by host slot, and `i` is a title index:
+                // the one the title's slot maps to (`self.slot`), or none
+                // where the heap has none (an unmade slot is always stale).
+                .filter(|&(i, (&[_, view, generation], current))| {
+                    match self.slot(i).and_then(|s| made.get(s as usize)) {
+                        Some(&m) if current => m != u64::from(generation) << 32 | u64::from(view),
+                        Some(&m) => m != 0,
+                        None => true,
+                    }
                 })
                 .map(|(i, _)| i)
                 .collect()
